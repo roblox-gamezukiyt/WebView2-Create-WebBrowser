@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -14,6 +15,7 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 using namespace Microsoft::WRL;
 
@@ -43,6 +45,9 @@ using namespace Microsoft::WRL;
 #define IDM_SETTINGS_DEVTOOLS      213
 #define IDM_BOOKMARK_ADD_REMOVE    220
 #define IDM_EXT_DISABLE_ALL_THIS_SITE 230
+#define IDM_EXT_ADD                231
+#define IDM_EXT_OPEN_POPUP_BASE    6000 // 6000-6199
+#define IDM_EXT_OPEN_OPTIONS_BASE  6200 // 6200-6399
 #define IDM_CLOSE_TAB              240
 
 // 可変メニューID範囲
@@ -79,6 +84,16 @@ std::wstring g_targetUrl = L"https://discord.com/app";
 std::wstring g_appName = L"Discord";
 
 bool g_darkMode = false;
+
+// 機能フラグ（実行時に features.txt から読み込む。無ければビルド時の既定値）
+struct Features {
+    bool nav = false, tabs = false, ext = false, bookmarks = false, settings = false, devtools = false;
+    int theme = DEFAULT_THEME;            // 0=デバイス設定 / 1=ホワイト / 2=ダーク
+    int search = DEFAULT_SEARCH_ENGINE;   // 0=Google / 1=Bing
+};
+Features g_feat;
+bool g_extensionsInstalled = false;
+std::map<std::wstring, std::wstring> g_extDirById;   // 拡張機能ID -> extensions 内のフォルダ
 int  g_searchEngine = 0;
 
 bool g_chromeHidden = false;
@@ -205,10 +220,48 @@ TabInfo* GetActiveTab() {
     return nullptr;
 }
 
+// 機能フラグ読み込み（<exe>\\features.txt）
+void LoadFeatures() {
+#ifdef ENABLE_NAV_BAR
+    g_feat.nav = true;
+#endif
+#ifdef ENABLE_TABS
+    g_feat.tabs = true;
+#endif
+#ifdef ENABLE_EXTENSIONS
+    g_feat.ext = true;
+#endif
+#ifdef ENABLE_BOOKMARKS
+    g_feat.bookmarks = true;
+#endif
+#ifdef ENABLE_SETTINGS_UI
+    g_feat.settings = true;
+#endif
+#ifdef ENABLE_DEVTOOLS
+    g_feat.devtools = true;
+#endif
+    std::wstring content = ReadFileRaw(GetExePath() + L"\\features.txt");
+    for (auto& line : SplitLines(content)) {
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, eq);
+        std::wstring val = line.substr(eq + 1);
+        bool on = (val == L"1");
+        if (key == L"nav") g_feat.nav = on;
+        else if (key == L"tabs") g_feat.tabs = on;
+        else if (key == L"ext") g_feat.ext = on;
+        else if (key == L"bookmarks") g_feat.bookmarks = on;
+        else if (key == L"settings") g_feat.settings = on;
+        else if (key == L"devtools") g_feat.devtools = on;
+        else if (key == L"theme") g_feat.theme = (val == L"1") ? 1 : (val == L"2") ? 2 : 0;
+        else if (key == L"search") g_feat.search = (val == L"1") ? 1 : 0;
+    }
+}
+
 // 設定読み書き
 void LoadSettings() {
-    g_darkMode = (DEFAULT_THEME == 2);
-    if (DEFAULT_THEME == 0) {
+    g_darkMode = (g_feat.theme == 2);
+    if (g_feat.theme == 0) {
         HKEY hKey;
         DWORD val = 1, sz = sizeof(val);
         if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -217,7 +270,7 @@ void LoadSettings() {
         }
         g_darkMode = (val == 0);
     }
-    g_searchEngine = DEFAULT_SEARCH_ENGINE;
+    g_searchEngine = g_feat.search;
 
     std::wstring content = ReadFileRaw(GetExePath() + L"\\config.txt");
     for (auto& line : SplitLines(content)) {
@@ -350,23 +403,484 @@ void ApplyExtensionSettingsForHost(const std::wstring& host) {
     }
 }
 
-// ダークモード
-std::wstring BuildDarkModeInitScript() {
-    std::wstring flag = g_darkMode ? L"true" : L"false";
-    return L"(function(){window.__appDarkMode = " + flag + L";"
-           L"function __applyDark(){var css = window.__appDarkMode ? 'html{filter:invert(1) hue-rotate(180deg) !important;background:#111 !important;}img,video,picture,canvas,svg,iframe{filter:invert(1) hue-rotate(180deg) !important;}' : '';"
-           L"var s = document.getElementById('__app_darkmode_style');if(!s){s=document.createElement('style');s.id='__app_darkmode_style';(document.head||document.documentElement).appendChild(s);}"
-           L"s.textContent = css;}if(document.readyState !== 'loading') __applyDark();else document.addEventListener('DOMContentLoaded', __applyDark);})();";
+// <exe>\extensions\<名前>\manifest.json がある展開済み拡張機能を探す
+std::wstring ManifestStamp(const std::wstring& dir);
+std::wstring ManifestStampForward(const std::wstring& dir) { return ManifestStamp(dir); }
+
+std::vector<std::wstring> FindExtensionDirs() {
+    std::vector<std::wstring> dirs;
+    std::wstring base = GetExePath() + L"\\extensions";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((base + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return dirs;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == L'.' || fd.cFileName[0] == L'_') continue;
+        std::wstring dir = base + L"\\" + fd.cFileName;
+        if (GetFileAttributesW((dir + L"\\manifest.json").c_str()) != INVALID_FILE_ATTRIBUTES) dirs.push_back(dir);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return dirs;
 }
 
-void ApplyDarkModeAllTabs() {
-    std::wstring toggleScript = L"window.__appDarkMode=" + std::wstring(g_darkMode ? L"true" : L"false") + L";"
-                                L"(function(){var css = window.__appDarkMode ? 'html{filter:invert(1) hue-rotate(180deg) !important;background:#111 !important;}img,video,picture,canvas,svg,iframe{filter:invert(1) hue-rotate(180deg) !important;}' : '';"
-                                L"var s=document.getElementById('__app_darkmode_style');if(!s){s=document.createElement('style');s.id='__app_darkmode_style';(document.head||document.documentElement).appendChild(s);}"
-                                L"s.textContent=css;})();";
-    for (auto& tab : g_tabs) {
-        if (tab.webView) tab.webView->ExecuteScript(toggleScript.c_str(), nullptr);
+// 最低限の JSON 文字列抽出（manifest.json の popup / options ページ取得用）
+std::wstring JsonString(const std::wstring& t, const std::wstring& key, size_t from = 0) {
+    std::wstring pat = L"\"" + key + L"\"";
+    size_t p = t.find(pat, from);
+    while (p != std::wstring::npos) {
+        size_t c = t.find_first_not_of(L" \t\r\n", p + pat.size());
+        if (c != std::wstring::npos && t[c] == L':') {
+            size_t q = t.find_first_not_of(L" \t\r\n", c + 1);
+            if (q != std::wstring::npos && t[q] == L'"') {
+                std::wstring out;
+                for (size_t i = q + 1; i < t.size(); ++i) {
+                    wchar_t ch = t[i];
+                    if (ch == L'"') return out;
+                    if (ch == L'\\' && i + 1 < t.size()) {
+                        wchar_t n = t[++i];
+                        if (n == L'u' && i + 4 < t.size()) {
+                            out.push_back((wchar_t)wcstoul(t.substr(i + 1, 4).c_str(), nullptr, 16));
+                            i += 4;
+                        } else out.push_back(n);
+                    } else out.push_back(ch);
+                }
+                return out;
+            }
+        }
+        p = t.find(pat, p + 1);
     }
+    return L"";
+}
+
+// 拡張機能の popup / 設定ページ（manifest.json から取得）。無ければ空
+std::wstring ExtManifestPage(const std::wstring& id, bool popup) {
+    auto it = g_extDirById.find(id);
+    if (it == g_extDirById.end()) return L"";
+    std::wstring m = ReadFileRaw(it->second + L"\\manifest.json");
+    std::wstring page;
+    if (popup) {
+        page = JsonString(m, L"default_popup");
+    } else {
+        size_t p = m.find(L"\"options_ui\"");
+        if (p != std::wstring::npos) page = JsonString(m, L"page", p);
+        if (page.empty()) page = JsonString(m, L"options_page");
+    }
+    while (!page.empty() && (page[0] == L'/' || page[0] == L'\\')) page.erase(0, 1);
+    return page;
+}
+
+// 状態ファイルの値は「更新印|拡張機能ID」。更新印が一致し、IDが記録されていれば導入済みとみなす
+bool StateEntryValid(const std::wstring& value, const std::wstring& dir) {
+    std::wstring stamp = ManifestStampForward(dir);
+    return !stamp.empty() && value.size() > stamp.size() + 1 && value.compare(0, stamp.size() + 1, stamp + L"|") == 0;
+}
+
+std::wstring ManifestStamp(const std::wstring& dir) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW((dir + L"\\manifest.json").c_str(), GetFileExInfoStandard, &d)) return L"";
+    ULONGLONG t = ((ULONGLONG)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
+    return std::to_wstring(t) + L"_" + std::to_wstring(d.nFileSizeLow);
+}
+
+// extensions フォルダ内の拡張機能をプロファイルに追加（新規・更新分のみ）。完了後に onDone を呼ぶ
+// ※ 状態ファイル extensions.state は「フォルダ|更新印|拡張機能ID」
+void InstallLocalExtensions(ICoreWebView2* wv, std::function<void()> onDone) {
+    std::vector<std::wstring> dirs = FindExtensionDirs();
+    ComPtr<ICoreWebView2_13> w13;
+    ComPtr<ICoreWebView2Profile> prof;
+    ComPtr<ICoreWebView2Profile7> p7;
+    if (dirs.empty() || !wv || FAILED(wv->QueryInterface(IID_PPV_ARGS(&w13))) || !w13 ||
+        FAILED(w13->get_Profile(&prof)) || !prof || FAILED(prof.As(&p7)) || !p7) {
+        onDone();
+        return;
+    }
+
+    FetchExtensions([dirs, p7, onDone]() {
+        auto state = std::make_shared<std::map<std::wstring, std::wstring>>();
+        for (auto& line : SplitLines(ReadFileRaw(GetExePath() + L"\\extensions.state"))) {
+            size_t bar = line.find(L'|');
+            if (bar != std::wstring::npos) (*state)[line.substr(0, bar)] = line.substr(bar + 1);
+        }
+        // プロファイルに1つも拡張機能が無い（データ削除後など）場合は全て入れ直す
+        bool anyInstalled = !g_extensionIdCache.empty();
+        auto todo = std::make_shared<std::vector<std::wstring>>();
+        for (auto& d : dirs) {
+            auto it = state->find(d);
+            if (!anyInstalled || it == state->end() || !StateEntryValid(it->second, d)) todo->push_back(d);
+        }
+
+        auto idx = std::make_shared<size_t>(0);
+        auto step = std::make_shared<std::function<void()>>();
+        auto finish = [dirs, state, onDone]() {
+            std::wstring content;
+            for (auto& d : dirs) {
+                auto it = state->find(d);
+                if (it != state->end() && !it->second.empty()) content += d + L"|" + it->second + L"\r\n";
+            }
+            WriteFileRaw(GetExePath() + L"\\extensions.state", content);
+            // 拡張機能ID -> フォルダ の対応（ポップアップ/設定画面を開くのに使う）
+            g_extDirById.clear();
+            for (auto& kv : *state) {
+                size_t bar = kv.second.find(L'|');
+                if (bar != std::wstring::npos && bar + 1 < kv.second.size()) g_extDirById[kv.second.substr(bar + 1)] = kv.first;
+            }
+            onDone();
+        };
+        *step = [todo, idx, step, p7, state, finish]() {
+            if (*idx >= todo->size()) { finish(); return; }
+            std::wstring dir = (*todo)[(*idx)++];
+            HRESULT hr = p7->AddBrowserExtension(dir.c_str(),
+                Callback<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler>(
+                    [step, state, dir](HRESULT result, ICoreWebView2BrowserExtension* ext) -> HRESULT {
+                        if (SUCCEEDED(result) && ext) {
+                            LPWSTR extId = nullptr;
+                            ext->get_Id(&extId);
+                            if (extId && *extId) (*state)[dir] = ManifestStamp(dir) + L"|" + extId;
+                            if (extId) CoTaskMemFree(extId);
+                        }
+                        (*step)();
+                        return S_OK;
+                    }).Get());
+            if (FAILED(hr)) (*step)();
+        };
+        (*step)();
+    });
+}
+
+// ============================================================
+// ダークモード（上部バーのみ。Webページの表示には一切手を加えない）
+// ============================================================
+struct BarTheme {
+    COLORREF bar;         // バー背景
+    COLORREF text;        // 文字色
+    COLORREF btn;         // ボタン背景
+    COLORREF btnPressed;  // ボタン押下時
+    COLORREF border;      // 枠線
+    COLORREF tabSel;      // 選択中タブ
+    COLORREF accent;      // 選択中タブの下線
+    COLORREF editBg;      // アドレスバー背景
+    COLORREF editText;    // アドレスバー文字
+};
+
+static const BarTheme THEME_LIGHT = {
+    RGB(240, 240, 240), RGB(32, 32, 32), RGB(228, 228, 228), RGB(203, 203, 203),
+    RGB(196, 196, 196), RGB(255, 255, 255), RGB(0, 120, 215), RGB(255, 255, 255), RGB(0, 0, 0)
+};
+static const BarTheme THEME_DARK = {
+    RGB(32, 32, 32), RGB(235, 235, 235), RGB(51, 51, 51), RGB(78, 78, 78),
+    RGB(70, 70, 70), RGB(64, 64, 64), RGB(96, 165, 250), RGB(44, 44, 44), RGB(240, 240, 240)
+};
+
+HBRUSH g_brBar = NULL;
+HBRUSH g_brEdit = NULL;
+HFONT  g_uiFont = NULL;
+
+const BarTheme& Theme() { return g_darkMode ? THEME_DARK : THEME_LIGHT; }
+
+// テーマ変更を反映（ブラシ再生成・タイトルバー・再描画）
+void ApplyBarTheme(HWND hWnd) {
+    const BarTheme& t = Theme();
+    if (g_brBar) DeleteObject(g_brBar);
+    if (g_brEdit) DeleteObject(g_brEdit);
+    g_brBar = CreateSolidBrush(t.bar);
+    g_brEdit = CreateSolidBrush(t.editBg);
+
+    // タイトルバー（Windows 10 20H1+ / Windows 11。非対応環境では何も起きない）
+    BOOL dark = g_darkMode ? TRUE : FALSE;
+    DwmSetWindowAttribute(hWnd, 19, &dark, sizeof(dark));   // 旧 DWMWA_USE_IMMERSIVE_DARK_MODE
+    DwmSetWindowAttribute(hWnd, 20, &dark, sizeof(dark));   // DWMWA_USE_IMMERSIVE_DARK_MODE
+    COLORREF cap = g_darkMode ? t.bar  : 0xFFFFFFFF;        // 0xFFFFFFFF = DWMWA_COLOR_DEFAULT
+    COLORREF txt = g_darkMode ? t.text : 0xFFFFFFFF;
+    DwmSetWindowAttribute(hWnd, 35, &cap, sizeof(cap));     // DWMWA_CAPTION_COLOR (Win11)
+    DwmSetWindowAttribute(hWnd, 36, &txt, sizeof(txt));     // DWMWA_TEXT_COLOR (Win11)
+
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
+}
+
+// ボタン（オーナードロー）
+void DrawBarButton(const DRAWITEMSTRUCT* dis) {
+    const BarTheme& t = Theme();
+    bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+
+    HBRUSH bg = CreateSolidBrush(pressed ? t.btnPressed : t.btn);
+    FillRect(dis->hDC, &dis->rcItem, bg);
+    DeleteObject(bg);
+    HBRUSH bd = CreateSolidBrush(t.border);
+    FrameRect(dis->hDC, &dis->rcItem, bd);
+    DeleteObject(bd);
+
+    wchar_t text[64] = L"";
+    GetWindowTextW(dis->hwndItem, text, 64);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, t.text);
+    HFONT oldFont = (HFONT)SelectObject(dis->hDC, g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    RECT rc = dis->rcItem;
+    DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dis->hDC, oldFont);
+}
+
+// ============================================================
+// 自前のタブバー（幅はタイトルの長さに応じて可変 / クリック・中クリック・右クリック・ドラッグ移動）
+// ============================================================
+static const int TAB_PAD = 14;     // 文字の左右余白
+static const int TAB_MIN = 72;     // 最小幅
+static const int TAB_MAX = 240;    // 最大幅
+static const int TAB_FLOOR = 36;   // 詰め込み時の下限
+#define WM_APP_CLOSETAB (WM_APP + 1)
+static const wchar_t* TABBAR_CLASS = L"WV2TabBar";
+
+int  g_tabDragIndex = -1;     // マウスを押しているタブ
+bool g_tabDragging = false;   // ドラッグ移動中か
+int  g_tabGrabX = 0;          // タブ内でつかんだ横位置
+POINT g_tabDownPt = { 0, 0 };
+int  g_tabHover = -1;
+bool g_tabTracking = false;
+
+std::wstring TabLabel(int i) {
+    const TabInfo& t = g_tabs[i];
+    std::wstring s = t.title;
+    if (s.empty()) s = GetHostFromUrl(t.url);
+    if (s.empty()) s = L"新しいタブ";
+    if (s.size() > 100) s = s.substr(0, 100);
+    return s;
+}
+
+std::vector<int> ComputeTabWidths(HWND hWnd) {
+    int count = (int)g_tabs.size();
+    std::vector<int> w(count > 0 ? count : 0);
+    if (count <= 0) return w;
+
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    HDC hdc = GetDC(hWnd);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    int total = 0;
+    for (int i = 0; i < count; ++i) {
+        std::wstring label = TabLabel(i);
+        SIZE sz = { 0, 0 };
+        GetTextExtentPoint32W(hdc, label.c_str(), (int)label.size(), &sz);
+        int width = sz.cx + TAB_PAD * 2;
+        if (width < TAB_MIN) width = TAB_MIN;
+        if (width > TAB_MAX) width = TAB_MAX;
+        w[i] = width;
+        total += width;
+    }
+    SelectObject(hdc, oldFont);
+    ReleaseDC(hWnd, hdc);
+
+    // 入りきらない場合は比率を保ったまま縮める
+    if (total > rc.right && rc.right > 0) {
+        for (int i = 0; i < count; ++i) {
+            w[i] = w[i] * rc.right / total;
+            if (w[i] < TAB_FLOOR) w[i] = TAB_FLOOR;
+        }
+    }
+    return w;
+}
+
+int TabHitTest(HWND hWnd, int px, int* outLeft = nullptr) {
+    std::vector<int> w = ComputeTabWidths(hWnd);
+    int x = 0;
+    for (int i = 0; i < (int)w.size(); ++i) {
+        if (px >= x && px < x + w[i]) {
+            if (outLeft) *outLeft = x;
+            return i;
+        }
+        x += w[i];
+    }
+    return -1;
+}
+
+// タブの並べ替え（g_tabs 内の位置を入れ替える。WebView は pointer で管理しているので影響なし）
+void MoveTab(int from, int to) {
+    int n = (int)g_tabs.size();
+    if (from < 0 || from >= n || to < 0 || to >= n || from == to) return;
+    TabInfo t = g_tabs[from];
+    g_tabs.erase(g_tabs.begin() + from);
+    g_tabs.insert(g_tabs.begin() + to, t);
+
+    if (g_activeTabIndex == from) g_activeTabIndex = to;
+    else if (from < g_activeTabIndex && g_activeTabIndex <= to) g_activeTabIndex--;
+    else if (to <= g_activeTabIndex && g_activeTabIndex < from) g_activeTabIndex++;
+
+    if (g_hTabCtrl) InvalidateRect(g_hTabCtrl, NULL, FALSE);
+}
+
+void ShowTabContextMenu(HWND hWnd, int idx) {
+    enum { CMD_CLOSE = 1, CMD_LEFT, CMD_RIGHT, CMD_REOPEN };
+    HMENU hMenu = CreatePopupMenu();
+    int n = (int)g_tabs.size();
+    if (idx >= 0) {
+        AppendMenuW(hMenu, MF_STRING, CMD_CLOSE, L"このタブを閉じる");
+        AppendMenuW(hMenu, MF_STRING | (idx > 0 ? MF_ENABLED : MF_GRAYED), CMD_LEFT, L"左へ移動");
+        AppendMenuW(hMenu, MF_STRING | (idx < n - 1 ? MF_ENABLED : MF_GRAYED), CMD_RIGHT, L"右へ移動");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
+    AppendMenuW(hMenu, MF_STRING | (g_closedTabUrls.empty() ? MF_GRAYED : MF_ENABLED), CMD_REOPEN, L"閉じたタブを再度開く");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    int cmd = (int)TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, NULL);
+    DestroyMenu(hMenu);
+
+    HWND parent = GetParent(hWnd);
+    switch (cmd) {
+    case CMD_CLOSE:  PostMessage(parent, WM_APP_CLOSETAB, (WPARAM)idx, 0); break;   // 右クリックしたタブを閉じる
+    case CMD_LEFT:   MoveTab(idx, idx - 1); break;
+    case CMD_RIGHT:  MoveTab(idx, idx + 1); break;
+    case CMD_REOPEN: PostMessage(parent, WM_COMMAND, IDM_REOPEN_CLOSED_TAB, 0); break;
+    }
+}
+
+LRESULT CALLBACK TabBarProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        int px = (short)LOWORD(lParam);
+        int left = 0;
+        int idx = TabHitTest(hWnd, px, &left);
+        if (idx >= 0) {
+            g_tabDragIndex = idx;
+            g_tabDragging = false;
+            g_tabGrabX = px - left;
+            g_tabDownPt.x = px;
+            g_tabDownPt.y = (short)HIWORD(lParam);
+            SetCapture(hWnd);
+            if (idx != g_activeTabIndex) SwitchToTab(idx);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int px = (short)LOWORD(lParam);
+        if (!g_tabTracking) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+            TrackMouseEvent(&tme);
+            g_tabTracking = true;
+        }
+        if (g_tabDragIndex >= 0 && (wParam & MK_LBUTTON)) {
+            if (!g_tabDragging && abs(px - g_tabDownPt.x) >= 5) g_tabDragging = true;
+            if (g_tabDragging) {
+                std::vector<int> w = ComputeTabWidths(hWnd);
+                int n = (int)w.size();
+                int di = g_tabDragIndex;
+                if (di >= 0 && di < n) {
+                    // つかんだタブの中心が、他のタブの中心を越えた数 = 移動先の位置
+                    int dragCenter = (px - g_tabGrabX) + w[di] / 2;
+                    int x = 0, target = 0;
+                    for (int j = 0; j < n; ++j) {
+                        if (j == di) continue;
+                        if (x + w[j] / 2 < dragCenter) target++;
+                        x += w[j];
+                    }
+                    if (target != di) {
+                        MoveTab(di, target);
+                        g_tabDragIndex = target;
+                    }
+                }
+            }
+        }
+        int hover = TabHitTest(hWnd, px);
+        if (hover != g_tabHover) {
+            g_tabHover = hover;
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_tabTracking = false;
+        if (g_tabHover != -1) {
+            g_tabHover = -1;
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hWnd) ReleaseCapture();
+        g_tabDragIndex = -1;
+        g_tabDragging = false;
+        return 0;
+    case WM_CAPTURECHANGED:
+        g_tabDragIndex = -1;
+        g_tabDragging = false;
+        return 0;
+
+    case WM_MBUTTONUP: {   // 中クリックで、カーソル下のタブを閉じる
+        int idx = TabHitTest(hWnd, (short)LOWORD(lParam));
+        if (idx >= 0) PostMessage(GetParent(hWnd), WM_APP_CLOSETAB, (WPARAM)idx, 0);
+        return 0;
+    }
+    case WM_RBUTTONUP: {   // 右クリックメニュー（カーソル下のタブが対象）
+        int idx = TabHitTest(hWnd, (short)LOWORD(lParam));
+        ShowTabContextMenu(hWnd, idx);
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
+        // ダブルバッファ
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+        const BarTheme& t = Theme();
+        HBRUSH bg = CreateSolidBrush(t.bar);
+        FillRect(mem, &rc, bg);
+        DeleteObject(bg);
+
+        SetBkMode(mem, TRANSPARENT);
+        HFONT oldFont = (HFONT)SelectObject(mem, g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+
+        std::vector<int> widths = ComputeTabWidths(hWnd);
+        int x = 0;
+        for (int i = 0; i < (int)widths.size(); ++i) {
+            RECT r = { x, 0, x + widths[i], rc.bottom };
+            x += widths[i];
+
+            if (i == g_activeTabIndex) {
+                HBRUSH selBr = CreateSolidBrush(t.tabSel);
+                FillRect(mem, &r, selBr);
+                DeleteObject(selBr);
+                RECT line = { r.left, r.bottom - 2, r.right, r.bottom };
+                HBRUSH acc = CreateSolidBrush(t.accent);
+                FillRect(mem, &line, acc);
+                DeleteObject(acc);
+            } else if (i == g_tabHover) {
+                HBRUSH hov = CreateSolidBrush(t.btn);
+                FillRect(mem, &r, hov);
+                DeleteObject(hov);
+            }
+            // 区切り線
+            RECT sep = { r.right - 1, r.top + 6, r.right, r.bottom - 6 };
+            HBRUSH sepBr = CreateSolidBrush(t.border);
+            FillRect(mem, &sep, sepBr);
+            DeleteObject(sepBr);
+
+            std::wstring label = TabLabel(i);
+            SetTextColor(mem, t.text);
+            RECT tr = r;
+            tr.left += TAB_PAD; tr.right -= TAB_PAD;
+            DrawTextW(mem, label.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldFont);
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
 // 全画面・UI切替
@@ -404,9 +918,9 @@ void ShowSettingsMenu(HWND hWnd) {
     AppendMenuW(hSearchMenu, MF_STRING | (g_searchEngine == 1 ? MF_CHECKED : MF_UNCHECKED), IDM_SETTINGS_SEARCH_BING, L"Bing");
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSearchMenu, L"検索エンジン");
 
-#ifdef ENABLE_DEVTOOLS
+if (g_feat.devtools) {
     AppendMenuW(hMenu, MF_STRING, IDM_SETTINGS_DEVTOOLS, L"デベロッパーツールを開く (F10)");
-#endif
+}
 
     POINT pt; GetCursorPos(&pt);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
@@ -432,6 +946,39 @@ void ShowBookmarksMenu(HWND hWnd) {
     DestroyMenu(hMenu);
 }
 
+// Chrome ウェブストア / Microsoft Edge アドオン の拡張機能ページか
+bool IsExtensionStoreUrl(const std::wstring& url) {
+    std::wstring u = url;
+    for (auto& c : u) c = (wchar_t)towlower(c);
+    return u.find(L"chromewebstore.google.com/detail") != std::wstring::npos ||
+           u.find(L"chrome.google.com/webstore/detail") != std::wstring::npos ||
+           u.find(L"microsoftedge.microsoft.com/addons/detail") != std::wstring::npos;
+}
+
+// Features.exe を起動（ストアのURLを渡すと、入力済みで確認画面まで進む）
+void LaunchFeaturesExe(HWND hWnd, const std::wstring& url) {
+    std::wstring exe = GetExePath() + L"\\Features.exe";
+    if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(hWnd, L"Features.exe が見つかりません。\n（rebuild_all.bat または build.bat で作り直してください）", L"拡張機能を追加", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring params = url.empty() ? L"" : (L"\"" + url + L"\"");
+    ShellExecuteW(hWnd, L"open", exe.c_str(), params.empty() ? NULL : params.c_str(), GetExePath().c_str(), SW_SHOWNORMAL);
+}
+
+// 拡張機能のページ（ポップアップ/設定画面）を開く
+void OpenExtensionPage(HWND hWnd, const std::wstring& id, bool popup) {
+    std::wstring page = ExtManifestPage(id, popup);
+    if (page.empty()) return;
+    std::wstring url = L"chrome-extension://" + id + L"/" + page;
+    if (g_feat.tabs) {
+        CreateTab(hWnd, url);
+    } else {
+        TabInfo* t = GetActiveTab();
+        if (t && t->webView) t->webView->Navigate(url.c_str());
+    }
+}
+
 void ShowExtensionsMenu(HWND hWnd) {
     TabInfo* tab = GetActiveTab();
     std::wstring host = tab ? GetHostFromUrl(tab->url) : L"";
@@ -452,6 +999,11 @@ void ShowExtensionsMenu(HWND hWnd) {
             bool disabledGlobally = IsExtensionDisabledGlobally(id);
 
             HMENU hSub = CreatePopupMenu();
+            bool hasPopup = !ExtManifestPage(id, true).empty();
+            bool hasOptions = !ExtManifestPage(id, false).empty();
+            if (hasPopup) AppendMenuW(hSub, MF_STRING, (UINT)(IDM_EXT_OPEN_POPUP_BASE + i), L"ポップアップを開く");
+            if (hasOptions) AppendMenuW(hSub, MF_STRING, (UINT)(IDM_EXT_OPEN_OPTIONS_BASE + i), L"設定画面を開く");
+            if (hasPopup || hasOptions) AppendMenuW(hSub, MF_SEPARATOR, 0, NULL);
             AppendMenuW(hSub, MF_STRING | (disabledHere ? MF_CHECKED : MF_UNCHECKED), (UINT)(IDM_EXT_ITEM_THIS_SITE_BASE + i), L"このサイトで無効にする");
             AppendMenuW(hSub, MF_STRING | (disabledGlobally ? MF_CHECKED : MF_UNCHECKED), (UINT)(IDM_EXT_ITEM_ALL_SITES_BASE + i), L"すべてのサイトで無効にする");
             AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSub, wname.c_str());
@@ -459,6 +1011,10 @@ void ShowExtensionsMenu(HWND hWnd) {
         if (g_extensionObjs.empty()) {
             AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"インストール済みの拡張機能はありません");
         }
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+        TabInfo* curTab = GetActiveTab();
+        AppendMenuW(hMenu, MF_STRING, IDM_EXT_ADD,
+                    (curTab && IsExtensionStoreUrl(curTab->url)) ? L"このページの拡張機能を追加…" : L"拡張機能を追加（ストアのURLから）…");
         POINT pt; GetCursorPos(&pt);
         TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
         DestroyMenu(hMenu);
@@ -580,17 +1136,17 @@ void SwitchToTab(int index) {
     if (index < 0 || index >= (int)g_tabs.size()) return;
     g_activeTabIndex = index;
 
-#ifdef ENABLE_TABS
-    if (g_hTabCtrl) TabCtrl_SetCurSel(g_hTabCtrl, g_activeTabIndex);
-#endif
+if (g_feat.tabs) {
+    if (g_hTabCtrl) InvalidateRect(g_hTabCtrl, NULL, FALSE);
+}
 
     TabInfo* tab = GetActiveTab();
     if (tab && g_hEditUrl) SetWindowTextW(g_hEditUrl, tab->url.c_str());
     if (tab) {
         SetWindowTextW(g_hWndMain, tab->title.empty() ? g_appName.c_str() : tab->title.c_str());
-#ifdef ENABLE_EXTENSIONS
+if (g_feat.ext) {
         ApplyExtensionSettingsForHost(GetHostFromUrl(tab->url));
-#endif
+}
     }
     ResizeUI(g_hWndMain);
 }
@@ -605,9 +1161,9 @@ void CloseTab(int index) {
     if (g_tabs[index].controller) g_tabs[index].controller->Release();
     g_tabs.erase(g_tabs.begin() + index);
 
-#ifdef ENABLE_TABS
-    if (g_hTabCtrl) TabCtrl_DeleteItem(g_hTabCtrl, index);
-#endif
+if (g_feat.tabs) {
+    if (g_hTabCtrl) InvalidateRect(g_hTabCtrl, NULL, FALSE);
+}
 
     if (g_tabs.empty()) {
         PostQuitMessage(0);
@@ -629,9 +1185,9 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
     }
 
     auto options = Make<CoreWebView2EnvironmentOptions>();
-#ifdef ENABLE_EXTENSIONS
+if (g_feat.ext) {
     if (options) options->put_AreBrowserExtensionsEnabled(TRUE);
-#endif
+}
 
     CreateCoreWebView2EnvironmentWithOptions(
         nullptr, userDataFolder.empty() ? nullptr : userDataFolder.c_str(), options.Get(),
@@ -667,13 +1223,11 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
                                                 if (ctrlDown) ToggleChromeHidden(hWnd);
                                                 else ToggleFullscreen(hWnd);
                                             }
-#ifdef ENABLE_DEVTOOLS
-                                            else if (key == VK_F10) {
+                                            else if (key == VK_F10 && g_feat.devtools) {
                                                 args->put_Handled(TRUE);
                                                 TabInfo* t = GetActiveTab();
                                                 if (t && t->webView) t->webView->OpenDevToolsWindow();
                                             }
-#endif
                                         }
                                         return S_OK;
                                     }).Get(), &accelToken);
@@ -711,9 +1265,6 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
                                     }
                                 }
 
-                                // ダークモードCSSの自動注入
-                                newTab.webView->AddScriptToExecuteOnDocumentCreated(BuildDarkModeInitScript().c_str(), nullptr);
-
                                 // URL変更検出
                                 EventRegistrationToken srcToken;
                                 newTab.webView->add_SourceChanged(
@@ -726,9 +1277,9 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
                                                         g_tabs[i].url = uri;
                                                         if ((int)i == g_activeTabIndex) {
                                                             if (g_hEditUrl) SetWindowTextW(g_hEditUrl, uri);
-#ifdef ENABLE_EXTENSIONS
+if (g_feat.ext) {
                                                             ApplyExtensionSettingsForHost(GetHostFromUrl(uri));
-#endif
+}
                                                         }
                                                         break;
                                                     }
@@ -749,16 +1300,9 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
                                                 for (size_t i = 0; i < g_tabs.size(); ++i) {
                                                     if (g_tabs[i].webView == sender) {
                                                         g_tabs[i].title = wtitle;
-#ifdef ENABLE_TABS
-                                                        if (g_hTabCtrl) {
-                                                            std::wstring shortTitle = wtitle;
-                                                            if (shortTitle.size() > 20) shortTitle = shortTitle.substr(0, 20) + L"...";
-                                                            TCITEM tie;
-                                                            tie.mask = TCIF_TEXT;
-                                                            tie.pszText = (LPWSTR)shortTitle.c_str();
-                                                            TabCtrl_SetItem(g_hTabCtrl, (int)i, &tie);
-                                                        }
-#endif
+if (g_feat.tabs) {
+                                                        if (g_hTabCtrl) InvalidateRect(g_hTabCtrl, NULL, FALSE);
+}
                                                         if ((int)i == g_activeTabIndex && !wtitle.empty()) {
                                                             SetWindowTextW(g_hWndMain, wtitle.c_str());
                                                         }
@@ -777,18 +1321,28 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
 
                             int createdIndex = (int)g_tabs.size() - 1;
 
-#ifdef ENABLE_TABS
-                            if (g_hTabCtrl) {
-                                TCITEM tie;
-                                tie.mask = TCIF_TEXT;
-                                std::wstring tabName = newTab.title.empty() ? (L"Tab " + std::to_wstring(g_tabs.size())) : newTab.title;
-                                tie.pszText = (LPWSTR)tabName.c_str();
-                                TabCtrl_InsertItem(g_hTabCtrl, createdIndex, &tie);
-                            }
-#endif
+if (g_feat.tabs) {
+                            if (g_hTabCtrl) InvalidateRect(g_hTabCtrl, NULL, FALSE);
+}
 
                             SwitchToTab(createdIndex);
-                            newTab.webView->Navigate(url.c_str());
+
+                            // 拡張機能は最初のタブで導入し、導入後にページを開く（広告ブロック等を最初から効かせる）
+                            ICoreWebView2* wvForNav = newTab.webView;
+                            std::wstring navUrl = url;
+                            auto navigate = [wvForNav, navUrl]() { wvForNav->Navigate(navUrl.c_str()); };
+                            if (g_feat.ext && !g_extensionsInstalled) {
+                                g_extensionsInstalled = true;
+                                InstallLocalExtensions(wvForNav, [navigate]() {
+                                    FetchExtensions([]() {
+                                        TabInfo* t = GetActiveTab();
+                                        ApplyExtensionSettingsForHost(t ? GetHostFromUrl(t->url) : L"");
+                                    });
+                                    navigate();
+                                });
+                            } else {
+                                navigate();
+                            }
 
                             return S_OK;
                         }).Get());
@@ -800,45 +1354,87 @@ void CreateTab(HWND hWnd, const std::wstring& url) {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
+        {
+            NONCLIENTMETRICSW ncm = { sizeof(ncm) };
+            SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+            g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
+        }
+
         INITCOMMONCONTROLSEX icex;
         icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
         icex.dwICC = ICC_TAB_CLASSES;
         InitCommonControlsEx(&icex);
 
-#ifdef ENABLE_TABS
-        g_hTabCtrl = CreateWindowEx(0, WC_TABCONTROL, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+if (g_feat.tabs) {
+        {
+            WNDCLASSW tbc = {};
+            tbc.lpfnWndProc = TabBarProc;
+            tbc.hInstance = GetModuleHandle(NULL);
+            tbc.lpszClassName = TABBAR_CLASS;
+            tbc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            RegisterClassW(&tbc);
+        }
+        g_hTabCtrl = CreateWindowExW(0, TABBAR_CLASS, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
             0, 0, 0, 0, hWnd, (HMENU)ID_TAB_CTRL, GetModuleHandle(NULL), NULL);
 
-        g_hBtnNewTab = CreateWindowEx(0, L"BUTTON", L"＋", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        g_hBtnNewTab = CreateWindowEx(0, L"BUTTON", L"＋", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_NEW_TAB, GetModuleHandle(NULL), NULL);
-#endif
+}
 
-#ifdef ENABLE_NAV_BAR
-        CreateWindowEx(0, L"BUTTON", L"←", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+if (g_feat.nav) {
+        CreateWindowEx(0, L"BUTTON", L"←", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_BACK, GetModuleHandle(NULL), NULL);
-        CreateWindowEx(0, L"BUTTON", L"→", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        CreateWindowEx(0, L"BUTTON", L"→", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_FORWARD, GetModuleHandle(NULL), NULL);
-        CreateWindowEx(0, L"BUTTON", L"更新", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        CreateWindowEx(0, L"BUTTON", L"更新", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_RELOAD, GetModuleHandle(NULL), NULL);
 
         g_hEditUrl = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             0, 0, 0, 0, hWnd, (HMENU)ID_EDIT_URL, GetModuleHandle(NULL), NULL);
 
         g_oldEditProc = (WNDPROC)SetWindowLongPtr(g_hEditUrl, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
-#endif
+}
 
-#ifdef ENABLE_BOOKMARKS
-        g_hBtnBookmark = CreateWindowEx(0, L"BUTTON", L"★", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+if (g_feat.bookmarks) {
+        g_hBtnBookmark = CreateWindowEx(0, L"BUTTON", L"★", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_BOOKMARK, GetModuleHandle(NULL), NULL);
-#endif
-#ifdef ENABLE_EXTENSIONS
-        g_hBtnExtensions = CreateWindowEx(0, L"BUTTON", L"⊞", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+}
+if (g_feat.ext) {
+        g_hBtnExtensions = CreateWindowEx(0, L"BUTTON", L"⊞", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_EXTENSIONS, GetModuleHandle(NULL), NULL);
-#endif
-#ifdef ENABLE_SETTINGS_UI
-        g_hBtnSettings = CreateWindowEx(0, L"BUTTON", L"⚙", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+}
+if (g_feat.settings) {
+        g_hBtnSettings = CreateWindowEx(0, L"BUTTON", L"⚙", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, hWnd, (HMENU)ID_BTN_SETTINGS, GetModuleHandle(NULL), NULL);
-#endif
+}
+
+        // 全コントロールに共通フォントを適用し、テーマを反映
+        EnumChildWindows(hWnd, [](HWND h, LPARAM) -> BOOL {
+            SendMessage(h, WM_SETFONT, (WPARAM)g_uiFont, TRUE);
+            return TRUE;
+        }, 0);
+        ApplyBarTheme(hWnd);
+        break;
+    }
+    case WM_ERASEBKGND: {
+        if (!g_brBar) return DefWindowProc(hWnd, message, wParam, lParam);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        FillRect((HDC)wParam, &rc, g_brBar);
+        return 1;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, Theme().editText);
+        SetBkColor(hdc, Theme().editBg);
+        return (LRESULT)g_brEdit;
+    }
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
+        if (dis && dis->CtlType == ODT_BUTTON) {
+            DrawBarButton(dis);
+            return TRUE;
+        }
         break;
     }
     case WM_COMMAND: {
@@ -850,6 +1446,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (idx < g_bookmarks.size() && tab && tab->webView) {
                 tab->webView->Navigate(g_bookmarks[idx].c_str());
             }
+            break;
+        }
+        if (cmdId >= IDM_EXT_OPEN_POPUP_BASE && cmdId < IDM_EXT_OPEN_POPUP_BASE + 200) {
+            size_t idx = cmdId - IDM_EXT_OPEN_POPUP_BASE;
+            if (idx < g_extensionIdCache.size()) OpenExtensionPage(hWnd, g_extensionIdCache[idx], true);
+            break;
+        }
+        if (cmdId >= IDM_EXT_OPEN_OPTIONS_BASE && cmdId < IDM_EXT_OPEN_OPTIONS_BASE + 200) {
+            size_t idx = cmdId - IDM_EXT_OPEN_OPTIONS_BASE;
+            if (idx < g_extensionIdCache.size()) OpenExtensionPage(hWnd, g_extensionIdCache[idx], false);
             break;
         }
         if (cmdId >= IDM_EXT_ITEM_THIS_SITE_BASE && cmdId < IDM_EXT_ITEM_THIS_SITE_BASE + 200) {
@@ -907,7 +1513,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             break;
         case IDM_SETTINGS_DARKMODE:
             g_darkMode = !g_darkMode;
-            ApplyDarkModeAllTabs();
+            ApplyBarTheme(hWnd);
             SaveSettings();
             break;
         case IDM_SETTINGS_SEARCH_GOOGLE:
@@ -918,13 +1524,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_searchEngine = 1;
             SaveSettings();
             break;
-#ifdef ENABLE_DEVTOOLS
         case IDM_SETTINGS_DEVTOOLS:
-            if (tab && tab->webView) tab->webView->OpenDevToolsWindow();
+            if (g_feat.devtools && tab && tab->webView) tab->webView->OpenDevToolsWindow();
             break;
-#endif
         case IDM_BOOKMARK_ADD_REMOVE:
             if (tab) { ToggleBookmark(tab->url); SaveBookmarks(); }
+            break;
+        case IDM_EXT_ADD:
+            LaunchFeaturesExe(hWnd, (tab && IsExtensionStoreUrl(tab->url)) ? tab->url : L"");
             break;
         case IDM_EXT_DISABLE_ALL_THIS_SITE:
             if (tab) {
@@ -942,31 +1549,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case ID_ACCEL_TOGGLE_CHROME:
             ToggleChromeHidden(hWnd);
             break;
-#ifdef ENABLE_DEVTOOLS
         case ID_ACCEL_DEVTOOLS:
-            if (tab && tab->webView) tab->webView->OpenDevToolsWindow();
+            if (g_feat.devtools && tab && tab->webView) tab->webView->OpenDevToolsWindow();
             break;
-#endif
         }
         break;
     }
-    case WM_NOTIFY: {
-        LPNMHDR pnmh = (LPNMHDR)lParam;
-        if (pnmh && pnmh->idFrom == ID_TAB_CTRL && pnmh->code == TCN_SELCHANGE) {
-            int sel = TabCtrl_GetCurSel(g_hTabCtrl);
-            SwitchToTab(sel);
-        }
-        break;
-    }
-    case WM_MBUTTONDOWN: { // マウスの中クリックでタブを閉じる
-        if (g_hTabCtrl) {
-            POINT pt = { LOWORD(lParam), HIWORD(lParam) };
-            TCHITTESTINFO hti = { pt, 0 };
-            int hit = TabCtrl_HitTest(g_hTabCtrl, &hti);
-            if (hit != -1) {
-                CloseTab(hit);
-            }
-        }
+    case WM_APP_CLOSETAB: {   // タブバーからの「閉じる」要求（中クリック・右クリックメニュー）
+        CloseTab((int)wParam);
         break;
     }
     case WM_CONTEXTMENU: {
@@ -988,6 +1578,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         break;
 
     case WM_DESTROY:
+        if (g_brBar) DeleteObject(g_brBar);
+        if (g_brEdit) DeleteObject(g_brEdit);
+        if (g_uiFont) DeleteObject(g_uiFont);
         for (auto& tab : g_tabs) {
             if (tab.webView) tab.webView->Release();
             if (tab.controller) tab.controller->Release();
@@ -1017,6 +1610,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!loadedName.empty()) g_appName = loadedName;
 
     LoadPermissions();
+    LoadFeatures();
     LoadSettings();
     LoadBookmarks();
     LoadExtSettings();
@@ -1047,12 +1641,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     CreateTab(g_hWndMain, g_targetUrl);
 
-#ifdef ENABLE_EXTENSIONS
+if (g_feat.ext) {
     FetchExtensions([]() {
         TabInfo* t = GetActiveTab();
         ApplyExtensionSettingsForHost(t ? GetHostFromUrl(t->url) : L"");
     });
-#endif
+}
 
     ACCEL accels[] = {
         { FVIRTKEY, VK_F11, ID_ACCEL_FULLSCREEN },
